@@ -69,8 +69,15 @@ declare global {
 async function openDatabase(): Promise<Database> {
   let db: Database;
   if (process.env.DATABASE_URL) {
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+    const pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: 5,
+      connectionTimeoutMillis: 5000,
+      idleTimeoutMillis: 30000,
+    });
     db = { query: (sql, params) => pool.query(sql, params) };
+    // Hosted databases are managed by the checked-in Supabase migration.
+    await db.query("SELECT id FROM public.workspaces LIMIT 0");
   } else {
     if (process.env.NODE_ENV === "production" && process.env.ALLOW_DEMO_LOGIN !== "true") {
       throw new Error("DATABASE_URL is required for a hosted production deployment");
@@ -78,9 +85,9 @@ async function openDatabase(): Promise<Database> {
     const local = new PGlite(process.env.THREADLY_DATA_DIR || path.join(process.cwd(), ".threadly-data"));
     await local.waitReady;
     db = { query: (sql, params) => local.query(sql, params as any[]) };
-  }
-  for (const statement of schema.split(";").map(part => part.trim()).filter(Boolean)) {
-    await db.query(statement);
+    for (const statement of schema.split(";").map(part => part.trim()).filter(Boolean)) {
+      await db.query(statement);
+    }
   }
   return db;
 }
