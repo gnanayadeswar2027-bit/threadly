@@ -1,9 +1,15 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { PGlite } from "@electric-sql/pglite";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import path from "node:path";
 
 type Result = { rows: Record<string, any>[]; rowCount?: number | null };
-type Database = { query: (sql: string, params?: unknown[]) => Promise<Result> };
+type Database = {
+  query: (sql: string, params?: unknown[]) => Promise<Result>;
+  withWorkspace?: <T>(workspaceId: string, operation: () => Promise<T>) => Promise<T>;
+};
+type WorkspaceTransaction = { workspaceId: string; client: PoolClient };
+const workspaceTransaction = new AsyncLocalStorage<WorkspaceTransaction>();
 
 const schema = `
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -75,9 +81,36 @@ async function openDatabase(): Promise<Database> {
       connectionTimeoutMillis: 5000,
       idleTimeoutMillis: 30000,
     });
-    db = { query: (sql, params) => pool.query(sql, params) };
     // Hosted databases are managed by the checked-in Supabase migration.
-    await db.query("SELECT id FROM public.workspaces LIMIT 0");
+    await pool.query("SELECT id FROM public.workspaces LIMIT 0");
+    db = {
+      query: async (sql, params) => {
+        const transaction = workspaceTransaction.getStore();
+        if (!transaction) throw new Error("Hosted database queries require an authenticated workspace");
+        return transaction.client.query(sql, params as any[]);
+      },
+      withWorkspace: async (workspaceId, operation) => {
+        const active = workspaceTransaction.getStore();
+        if (active) {
+          if (active.workspaceId !== workspaceId) throw new Error("Workspace context cannot change inside a database transaction");
+          return operation();
+        }
+
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query("SELECT set_config('threadly.workspace_id', $1, true)", [workspaceId]);
+          const result = await workspaceTransaction.run({ workspaceId, client }, operation);
+          await client.query("COMMIT");
+          return result;
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+    };
   } else {
     if (process.env.NODE_ENV === "production" && process.env.ALLOW_DEMO_LOGIN !== "true") {
       throw new Error("DATABASE_URL is required for a hosted production deployment");
@@ -92,10 +125,31 @@ async function openDatabase(): Promise<Database> {
   return db;
 }
 
-export function database(): Promise<Database> {
+async function baseDatabase(): Promise<Database> {
   globalThis.threadlyDb ??= openDatabase().catch(error => {
     globalThis.threadlyDb = undefined;
     throw error;
   });
   return globalThis.threadlyDb;
+}
+
+export async function database(workspaceId?: string): Promise<Database> {
+  const db = await baseDatabase();
+  if (!db.withWorkspace) return db;
+  if (!workspaceId?.trim()) throw new Error("Authenticated workspace is required for hosted database access");
+  const active = workspaceTransaction.getStore();
+  if (active) {
+    if (active.workspaceId !== workspaceId) throw new Error("Workspace context does not match the authenticated user");
+    return db;
+  }
+  return {
+    query: (sql, params) => db.withWorkspace!(workspaceId, () => db.query(sql, params)),
+  };
+}
+
+export async function withWorkspace<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+  const db = await baseDatabase();
+  if (!db.withWorkspace) return operation();
+  if (!workspaceId.trim()) throw new Error("Authenticated workspace is required for hosted database access");
+  return db.withWorkspace(workspaceId, operation);
 }

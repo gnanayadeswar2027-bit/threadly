@@ -21,7 +21,7 @@ export function ensureWorkspace(email: string): Promise<void> {
 }
 
 async function initializeWorkspace(email: string) {
-  const db = await database();
+  const db = await database(email);
   const demo = email === "demo@threadly.app";
   const blankContext = Object.fromEntries(["website", "description", "industry", "customer", "icp", "titles", "painPoints", "competitors", "voice", "objective"].map(key => [key, ""]));
   const demoContext = { ...blankContext, description: "An AI product helping founders build more meaningful customer conversations.", industry: "B2B SaaS", customer: "Early-stage SaaS founders", icp: "B2B founders building their first repeatable GTM motion", titles: "Founder, CEO, Head of Growth", painPoints: "Finding relevant conversations, turning content into leads", voice: "Smart, conversational, practical", objective: "Generate qualified demo conversations" };
@@ -35,7 +35,7 @@ async function initializeWorkspace(email: string) {
 
 export async function getState(email: string) {
   await ensureWorkspace(email);
-  const db = await database();
+  const db = await database(email);
   const [workspace, opportunities, drafts, leads] = await Promise.all([
     db.query("SELECT * FROM workspaces WHERE id=$1", [email]),
     db.query("SELECT * FROM opportunities WHERE workspace_id=$1 ORDER BY CASE WHEN source_kind='manual' THEN 0 ELSE 1 END, relevance DESC, observed_at DESC", [email]),
@@ -60,7 +60,7 @@ export async function saveManualOpportunity(email: string, input: { url: string;
   if (!["High", "Medium", "Low"].includes(input.intent)) throw new Error("Choose an intent level");
   const sourceUrl = `https://www.reddit.com/r/${match[1]}/comments/${match[2]}/`;
   await ensureWorkspace(email);
-  const db = await database();
+  const db = await database(email);
   const inserted = await db.query("INSERT INTO opportunities (id,workspace_id,platform,community,author,title,body,pain,intent,relevance,engagement,source_url,source_kind) VALUES ($1,$2,'Reddit',$3,$4,$5,$6,$7,$8,0,'',$9,'manual') ON CONFLICT DO NOTHING RETURNING id", [randomUUID(), email, `r/${match[1]}`, author || "Not recorded", title, body, pain, input.intent, sourceUrl]);
   if (inserted.rows.length) return inserted.rows[0].id as string;
   const existing = await db.query("SELECT id FROM opportunities WHERE workspace_id=$1 AND source_url=$2 AND source_kind='manual'", [email, sourceUrl]);
@@ -70,18 +70,18 @@ export async function saveManualOpportunity(email: string, input: { url: string;
 export async function updateContext(email: string, context: Record<string, string>, name: string) {
   if (!context || typeof context !== "object" || Array.isArray(context) || typeof name !== "string") throw new Error("Invalid company context");
   if (Object.values(context).some(value => typeof value !== "string")) throw new Error("Company context must contain text fields");
-  const db = await database();
+  const db = await database(email);
   await db.query("UPDATE workspaces SET name=$1, context=$2 WHERE id=$3", [name.trim() || "My company", JSON.stringify(context), email]);
 }
 
 export async function updateOpportunity(email: string, id: string, status: string) {
   if (!["new", "saved", "dismissed"].includes(status)) throw new Error("Invalid opportunity status");
-  const db = await database();
+  const db = await database(email);
   await db.query("UPDATE opportunities SET status=$1 WHERE id=$2 AND workspace_id=$3", [status, id, email]);
 }
 
 export async function saveDraft(email: string, input: { id?: string; opportunityId?: string; platform: string; kind: string; text: string }) {
-  const db = await database();
+  const db = await database(email);
   if (!input.text.trim()) throw new Error("Draft text is required");
   if (input.id) {
     const result = await db.query("UPDATE drafts SET text=$1, platform=$2, kind=$3, status='draft', approved_at=NULL, approved_by=NULL WHERE id=$4 AND workspace_id=$5 RETURNING id", [input.text, input.platform, input.kind, input.id, email]);
@@ -98,38 +98,38 @@ export async function saveDraft(email: string, input: { id?: string; opportunity
 }
 
 export async function approveDraft(email: string, id: string) {
-  const db = await database();
+  const db = await database(email);
   const result = await db.query("UPDATE drafts SET status='approved', approved_at=now(), approved_by=$1 WHERE id=$2 AND workspace_id=$3 AND status IN ('draft','review') RETURNING id", [email, id, email]);
   if (!result.rows.length) throw new Error("Draft cannot be approved");
 }
 
 export async function scheduleDraft(email: string, id: string, date: string) {
   if (Number.isNaN(Date.parse(date))) throw new Error("Choose a valid date");
-  const db = await database();
+  const db = await database(email);
   const result = await db.query("UPDATE drafts SET status='scheduled', scheduled_at=$1 WHERE id=$2 AND workspace_id=$3 AND status IN ('approved','scheduled') RETURNING id", [date, id, email]);
   if (!result.rows.length) throw new Error("Only approved content can be planned");
 }
 
 export async function cancelSchedule(email: string, id: string) {
-  const db = await database();
+  const db = await database(email);
   const result = await db.query("UPDATE drafts SET status='approved', scheduled_at=NULL WHERE id=$1 AND workspace_id=$2 AND status='scheduled' RETURNING id", [id, email]);
   if (!result.rows.length) throw new Error("Planned item not found");
 }
 
 export async function duplicateDraft(email: string, id: string) {
-  const db = await database();
+  const db = await database(email);
   const result = await db.query("INSERT INTO drafts (id,workspace_id,opportunity_id,platform,kind,text,status,origin) SELECT $1,workspace_id,opportunity_id,platform,kind,text,'draft','user' FROM drafts WHERE id=$2 AND workspace_id=$3 RETURNING id", [randomUUID(), id, email]);
   if (!result.rows.length) throw new Error("Draft not found");
 }
 
 export async function markPublished(email: string, id: string) {
-  const db = await database();
+  const db = await database(email);
   const result = await db.query("UPDATE drafts SET status='published' WHERE id=$1 AND workspace_id=$2 AND status='scheduled' RETURNING id", [id, email]);
   if (!result.rows.length) throw new Error("Only a planned item can be marked published");
 }
 
 export async function saveLead(email: string, input: { opportunityId?: string; name: string; company?: string; role?: string; platform: string; pain?: string; notes?: string }) {
-  const db = await database();
+  const db = await database(email);
   if (!input.name.trim()) throw new Error("Lead name is required");
   if (input.opportunityId) {
     const source = await db.query("SELECT id FROM opportunities WHERE id=$1 AND workspace_id=$2", [input.opportunityId, email]);
@@ -140,14 +140,14 @@ export async function saveLead(email: string, input: { opportunityId?: string; n
 
 export async function moveLead(email: string, id: string, stage: string) {
   if (!["identified", "engaged", "qualified", "conversation", "converted"].includes(stage)) throw new Error("Invalid lead stage");
-  const db = await database();
+  const db = await database(email);
   const result = await db.query("UPDATE leads SET stage=$1 WHERE id=$2 AND workspace_id=$3 RETURNING id", [stage, id, email]);
   if (!result.rows.length) throw new Error("Lead not found");
 }
 
 export async function generateDrafts(email: string, opportunityId: string, platform: string, tone: string) {
   if (!process.env.OPENAI_API_KEY) throw new Error("AI generation is unavailable. Add OPENAI_API_KEY to enable it.");
-  const db = await database();
+  const db = await database(email);
   const source = await db.query("SELECT * FROM opportunities WHERE id=$1 AND workspace_id=$2", [opportunityId, email]);
   if (!source.rows.length) throw new Error("Source opportunity not found");
   const workspace = await db.query("SELECT context FROM workspaces WHERE id=$1", [email]);
