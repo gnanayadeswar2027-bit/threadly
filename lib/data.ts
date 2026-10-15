@@ -1,14 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { database } from "./db";
-
-const samples = [
-  { platform: "Reddit", community: "r/SaaS", author: "u/launchfounder", title: "How are you finding your first 20 customers without cold outreach?", body: "We've built a useful product, but every channel feels saturated. Curious what's working for other early founders.", pain: "Finding qualified early customers", intent: "High", relevance: 96, engagement: "42 comments · 118 upvotes", source_url: "https://www.reddit.com/r/SaaS/" },
-  { platform: "LinkedIn", community: "Founder-led growth", author: "Maya Chen", title: "Our content gets likes, but almost no conversations", body: "We publish consistently, yet the people we want to reach rarely respond. I think we're talking at them instead of with them.", pain: "Content not creating conversations", intent: "High", relevance: 93, engagement: "64 reactions · 19 comments", source_url: "https://www.linkedin.com/feed/" },
-  { platform: "X", community: "SaaS founders", author: "@buildwithsam", title: "Where do you actually listen to customer problems?", body: "Founder question: which communities give you the clearest signal about what buyers need right now?", pain: "Finding reliable customer signals", intent: "Medium", relevance: 89, engagement: "31 replies · 84 likes", source_url: "https://x.com/" },
-  { platform: "Reddit", community: "r/startups", author: "u/growthnotes", title: "We keep writing posts nobody asked for", body: "Trying to build a repeatable way to turn real customer questions into useful content instead of guessing.", pain: "Content ideation", intent: "Medium", relevance: 87, engagement: "27 comments · 76 upvotes", source_url: "https://www.reddit.com/r/startups/" },
-  { platform: "LinkedIn", community: "B2B marketing", author: "Alex Rivera", title: "The best research is hiding in public conversations", body: "Teams overproduce content and underinvest in listening. What signals do you use to pick a topic?", pain: "Prioritizing GTM research", intent: "Medium", relevance: 84, engagement: "112 reactions · 33 comments", source_url: "https://www.linkedin.com/feed/" },
-  { platform: "X", community: "Indie makers", author: "@founderdiary", title: "A question for solo founders doing their own GTM", body: "How do you decide which conversations are worth joining when there are hundreds every week?", pain: "Opportunity prioritization", intent: "High", relevance: 91, engagement: "46 replies · 132 likes", source_url: "https://x.com/" },
-];
+import { xProvider } from "./apify-x";
+import type { XPost } from "./x-discovery";
 
 const initializingWorkspaces = new Map<string, Promise<void>>();
 
@@ -25,12 +18,8 @@ async function initializeWorkspace(email: string) {
   const demo = email === "demo@threadly.app";
   const blankContext = Object.fromEntries(["website", "description", "industry", "customer", "icp", "titles", "painPoints", "competitors", "voice", "objective"].map(key => [key, ""]));
   const demoContext = { ...blankContext, description: "An AI product helping founders build more meaningful customer conversations.", industry: "B2B SaaS", customer: "Early-stage SaaS founders", icp: "B2B founders building their first repeatable GTM motion", titles: "Founder, CEO, Head of Growth", painPoints: "Finding relevant conversations, turning content into leads", voice: "Smart, conversational, practical", objective: "Generate qualified demo conversations" };
-  const created = await db.query("INSERT INTO workspaces (id,name,context) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING id", [email, demo ? "Acme AI" : "My company", JSON.stringify(demo ? demoContext : blankContext)]);
-  if (!created.rows.length || email !== "demo@threadly.app") return;
-  for (const [index, s] of samples.entries()) {
-    await db.query("INSERT INTO opportunities (id,workspace_id,platform,community,author,title,body,pain,intent,relevance,engagement,source_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING", [`${email}-sample-${index + 1}`, email, s.platform, s.community, s.author, s.title, s.body, s.pain, s.intent, s.relevance, s.engagement, null]);
-  }
-  await db.query("INSERT INTO drafts (id,workspace_id,opportunity_id,platform,kind,text,status,origin) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING", [`${email}-sample-draft`, email, `${email}-sample-1`, "Reddit", "Discussion response", "One thing that helped us was starting with the places our customers already ask for advice. We saved the questions that came up repeatedly, then answered those directly before talking about our product. Which communities have given you the clearest signal so far?", "review", "sample"]);
+  await db.query("INSERT INTO workspaces (id,name,context) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING id", [email, demo ? "Acme AI" : "My company", JSON.stringify(demo ? demoContext : blankContext)]);
+
 }
 
 export async function getState(email: string) {
@@ -38,33 +27,11 @@ export async function getState(email: string) {
   const db = await database(email);
   const [workspace, opportunities, drafts, leads] = await Promise.all([
     db.query("SELECT * FROM workspaces WHERE id=$1", [email]),
-    db.query("SELECT * FROM opportunities WHERE workspace_id=$1 ORDER BY CASE WHEN source_kind='manual' THEN 0 ELSE 1 END, relevance DESC, observed_at DESC", [email]),
+    db.query("SELECT * FROM opportunities WHERE workspace_id=$1 ORDER BY observed_at DESC", [email]),
     db.query("SELECT * FROM drafts WHERE workspace_id=$1 ORDER BY created_at DESC", [email]),
     db.query("SELECT * FROM leads WHERE workspace_id=$1 ORDER BY created_at DESC", [email]),
   ]);
-  return { workspace: workspace.rows[0], opportunities: opportunities.rows, drafts: drafts.rows, leads: leads.rows, capabilities: { ai: Boolean(process.env.OPENAI_API_KEY), liveSources: false, publishing: false, manualCapture: email !== "demo@threadly.app" || process.env.NODE_ENV !== "production" }, demo: email === "demo@threadly.app" };
-}
-
-export async function saveManualOpportunity(email: string, input: { url: string; title: string; body: string; pain?: string; intent: string; author?: string }) {
-  if (!input || typeof input.url !== "string" || typeof input.title !== "string" || typeof input.body !== "string" || typeof input.intent !== "string") throw new Error("Complete the conversation details");
-  let parsed: URL;
-  try { parsed = new URL(input.url.trim()); } catch { throw new Error("Enter a Reddit post link"); }
-  const allowedHosts = new Set(["reddit.com", "www.reddit.com", "old.reddit.com", "np.reddit.com"]);
-  const match = parsed.pathname.match(/^\/r\/([A-Za-z0-9_]+)\/comments\/([A-Za-z0-9]+)(?:\/[^?#]*)?\/?$/);
-  if (!["http:", "https:"].includes(parsed.protocol) || !allowedHosts.has(parsed.hostname) || parsed.port || parsed.username || parsed.password || !match) throw new Error("Enter a Reddit post link");
-  const title = input.title.trim();
-  const body = input.body.trim();
-  const pain = typeof input.pain === "string" ? input.pain.trim() : "";
-  const author = typeof input.author === "string" ? input.author.trim() : "";
-  if (!title || !body || title.length > 200 || body.length > 2000 || pain.length > 120 || author.length > 80) throw new Error("Add a short title and your own summary");
-  if (!["High", "Medium", "Low"].includes(input.intent)) throw new Error("Choose an intent level");
-  const sourceUrl = `https://www.reddit.com/r/${match[1]}/comments/${match[2]}/`;
-  await ensureWorkspace(email);
-  const db = await database(email);
-  const inserted = await db.query("INSERT INTO opportunities (id,workspace_id,platform,community,author,title,body,pain,intent,relevance,engagement,source_url,source_kind) VALUES ($1,$2,'Reddit',$3,$4,$5,$6,$7,$8,0,'',$9,'manual') ON CONFLICT DO NOTHING RETURNING id", [randomUUID(), email, `r/${match[1]}`, author || "Not recorded", title, body, pain, input.intent, sourceUrl]);
-  if (inserted.rows.length) return inserted.rows[0].id as string;
-  const existing = await db.query("SELECT id FROM opportunities WHERE workspace_id=$1 AND source_url=$2 AND source_kind='manual'", [email, sourceUrl]);
-  return existing.rows[0].id as string;
+  return { workspace: workspace.rows[0], opportunities: opportunities.rows.filter(o => o.platform === "X" && o.source_kind !== "demo"), drafts: drafts.rows.filter(d => d.platform === "X" && d.origin !== "sample"), leads: leads.rows.filter(l => l.platform === "X"), capabilities: { ai: Boolean(process.env.OPENAI_API_KEY), liveSources: Boolean(xProvider()), xProvider: xProvider(), publishing: false, manualCapture: false }, demo: email === "demo@threadly.app" };
 }
 
 export async function updateContext(email: string, context: Record<string, string>, name: string) {
@@ -159,5 +126,12 @@ export async function generateDrafts(email: string, opportunityId: string, platf
   if (!Array.isArray(variations) || variations.length !== 3 || variations.some((v: unknown) => typeof v !== "string" || !v.trim())) throw new Error("AI returned an invalid draft set");
   for (const text of variations) {
     await db.query("INSERT INTO drafts (id,workspace_id,opportunity_id,platform,kind,text,origin) VALUES ($1,$2,$3,$4,'Discussion response',$5,'ai')", [randomUUID(), email, opportunityId, platform, text]);
+  }
+}
+
+export async function storeXResults(email: string, posts: XPost[], provider: string) {
+  const db = await database(email);
+  for (const post of posts) {
+    await db.query("INSERT INTO opportunities (id,workspace_id,platform,community,author,title,body,pain,intent,relevance,engagement,source_url,source_kind,status) VALUES ($1,$2,'X','Public X post',$3,$4,$5,'','Unrated',0,$6,$7,$8,'new') ON CONFLICT (id) DO UPDATE SET body=EXCLUDED.body,engagement=EXCLUDED.engagement", [`${email}-x-${post.id}`,email,post.author || 'Unknown',post.text.slice(0,160),post.text,post.metrics ? `${post.metrics.likes} likes · ${post.metrics.replies} replies · ${post.metrics.reposts} reposts` : 'Metrics unavailable',post.url,provider === 'Apify' ? 'x_apify' : 'x_api']);
   }
 }

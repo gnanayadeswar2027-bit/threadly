@@ -8,58 +8,41 @@ const dataDir = await mkdtemp(path.join(tmpdir(), "threadly-test-"));
 process.env.THREADLY_DATA_DIR = dataDir;
 const data = await import("../lib/data");
 
-test("concurrent first loads create only one sample set", async () => {
-  const email = "demo@threadly.app";
-  const [first, second] = await Promise.all([data.getState(email), data.getState(email)]);
-  assert.equal(first.opportunities.length, 6);
-  assert.equal(second.opportunities.length, 6);
-  assert.equal(first.drafts.length, 1);
-  assert.equal(second.drafts.length, 1);
-  const later = await data.getState(email);
-  assert.equal(later.opportunities.length, 6);
-  assert.equal(later.drafts.length, 1);
-});
-
-test("a new real workspace starts empty and can save a Reddit conversation once", async () => {
-  const email = "founder@example.com";
-  const initial = await data.getState(email);
-  assert.equal(initial.demo, false);
-  assert.equal(initial.opportunities.length, 0);
-  assert.equal(initial.drafts.length, 0);
-  assert.equal(initial.workspace.context.description, "");
-
-  const input = {
-    url: "https://www.reddit.com/r/SaaS/comments/abc123/a_question/?utm_source=share",
-    title: "Founder asks about first customers",
-    body: "I want to answer their question about finding early users.",
-    pain: "Customer acquisition",
-    intent: "High",
-  };
-  const id = await data.saveManualOpportunity(email, input);
-  const duplicateId = await data.saveManualOpportunity(email, { ...input, url: "https://old.reddit.com/r/SaaS/comments/abc123/a_question/" });
-  assert.equal(duplicateId, id);
-  const state = await data.getState(email);
-  assert.equal(state.opportunities.length, 1);
-  assert.equal(state.opportunities[0].source_kind, "manual");
-  assert.equal(state.opportunities[0].source_url, "https://www.reddit.com/r/SaaS/comments/abc123/");
-  assert.equal(state.opportunities[0].relevance, 0);
-  assert.equal(state.opportunities[0].community, "r/SaaS");
-  assert.equal((await data.getState("other-founder@example.com")).opportunities.length, 0);
-});
-
-test("manual capture rejects non-post URLs and empty notes", async () => {
-  const email = "validator@example.com";
+const fixture = {id:'12345',text:'How can we improve customer onboarding?',author:'founder',url:'https://x.com/i/web/status/12345',createdAt:'2026-10-15T08:00:00Z',metrics:null};
+async function sourceFor(email: string) {
   await data.getState(email);
-  const input = { url: "https://www.reddit.com/r/SaaS/comments/abc123/a_question/", title: "A useful note", body: "My own summary", pain: "", intent: "Medium" };
-  await assert.rejects(data.saveManualOpportunity(email, { ...input, url: "https://reddit.com.evil.example/r/SaaS/comments/abc123/" }));
-  await assert.rejects(data.saveManualOpportunity(email, { ...input, url: "https://www.reddit.com/r/SaaS/" }));
-  await assert.rejects(data.saveManualOpportunity(email, { ...input, title: "  " }));
+  await data.storeXResults(email,[fixture],'Apify');
+  return `${email}-x-${fixture.id}`;
+}
+test("concurrent first loads contain no fabricated posts or drafts", async () => {
+  const states = await Promise.all([data.getState('demo@threadly.app'),data.getState('demo@threadly.app')]);
+  for (const state of states) {assert.equal(state.opportunities.length,0);assert.equal(state.drafts.length,0);}
+});
+test("X results persist once, preserve source, and stay workspace scoped", async () => {
+  const email='founder@example.com';
+  const id=await sourceFor(email);
+  await data.updateOpportunity(email,id,'saved');
+  await sourceFor(email);
+  const state=await data.getState(email);
+  assert.equal(state.opportunities.length,1);
+  assert.equal(state.opportunities[0].source_kind,'x_apify');
+  assert.equal(state.opportunities[0].body,fixture.text);
+  assert.equal(state.opportunities[0].source_url,fixture.url);
+  assert.equal(state.opportunities[0].intent,'Unrated');
+  assert.equal(state.opportunities[0].status,'saved');
+  assert.equal((await data.getState('outsider@example.com')).opportunities.length,0);
+});
+test("legacy non-X records and sample records are not returned", async () => {
+  const {database}=await import('../lib/db');
+  const email='legacy@example.com'; await data.getState(email);const db=await database(email);
+  await db.query("INSERT INTO opportunities (id,workspace_id,platform,community,author,title,body,pain,intent,relevance,engagement,source_kind) VALUES ('old-hn',$1,'Hacker News','','','old post','','','Unrated',0,'','hn'),('old-sample',$1,'X','','','sample post','','','High',99,'','demo')",[email]);
+  assert.equal((await data.getState(email)).opportunities.length,0);
 });
 
 test("draft approval, reminder changes, manual publication, and duplication", async () => {
   const email = "author@example.com";
   await data.getState(email);
-  const sourceId = await data.saveManualOpportunity(email, { url: "https://www.reddit.com/r/SaaS/comments/def456/a_question/", title: "A founder question", body: "What I noticed", pain: "Acquisition", intent: "High" });
+  const sourceId = await sourceFor(email);
   const source = (await data.getState(email)).opportunities.find(opportunity => opportunity.id === sourceId);
   assert.ok(source);
   const id = await data.saveDraft(email, { opportunityId: source.id, platform: source.platform, kind: "Discussion response", text: "A useful answer" });
@@ -86,7 +69,7 @@ test("workspace data is isolated", async () => {
   const owner = "owner@example.com";
   const other = "other@example.com";
   await data.getState(owner);
-  const sourceId = await data.saveManualOpportunity(owner, { url: "https://www.reddit.com/r/startups/comments/ghi789/topic/", title: "A question", body: "My note", pain: "Growth", intent: "Medium" });
+  const sourceId = await sourceFor(owner);
   const source = (await data.getState(owner)).opportunities.find(opportunity => opportunity.id === sourceId);
   assert.ok(source);
   await data.getState(other);

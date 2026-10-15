@@ -1,5 +1,5 @@
 import { auth } from "@/auth";
-import { approveDraft, cancelSchedule, duplicateDraft, generateDrafts, getState, markPublished, moveLead, saveDraft, saveLead, saveManualOpportunity, scheduleDraft, updateContext, updateOpportunity } from "@/lib/data";
+import { approveDraft, cancelSchedule, duplicateDraft, generateDrafts, getState, markPublished, moveLead, saveDraft, saveLead, scheduleDraft, updateContext, updateOpportunity } from "@/lib/data";
 import { withWorkspace } from "@/lib/db";
 
 export const runtime = "nodejs";
@@ -10,6 +10,7 @@ export async function POST(request: Request) {
   const email = session.user.email;
   try {
     const body = await request.json();
+    if (["draft", "lead", "generate"].includes(body.action) && body.platform !== "X") return Response.json({error: "Only X is supported."}, {status:400});
     if (body.action === "generate") {
       await withWorkspace(email, () => getState(email));
       await generateDrafts(email, body.opportunityId, body.platform, body.tone);
@@ -20,10 +21,6 @@ export async function POST(request: Request) {
       switch (body.action) {
         case "context": await updateContext(email, body.context, body.name); break;
         case "opportunity": await updateOpportunity(email, body.id, body.status); break;
-        case "manualOpportunity":
-          if (email === "demo@threadly.app" && process.env.NODE_ENV === "production") return Response.json({ error: "This public demo cannot store private notes. Sign in to your own workspace." }, { status: 403 });
-          await saveManualOpportunity(email, body);
-          break;
         case "draft": await saveDraft(email, body); break;
         case "approve": await approveDraft(email, body.id); break;
         case "schedule": await scheduleDraft(email, body.id, body.date); break;
